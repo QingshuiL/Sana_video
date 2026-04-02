@@ -13,6 +13,7 @@ QuantFormat = Literal["int", "mxfp", "nvfp"]
 LinearGranularity = Literal["per_token", "per_channel"]
 FP32_MIN_NORMAL = 2 ** (-126)
 MXFP_SCALE_BITS = 8
+MXFP_BLOCK_SIZE = 32
 
 
 @dataclass
@@ -114,6 +115,64 @@ def _quantize_elemwise_core_mxfp(
     return quantized
 
 
+def _reshape_to_blocks(
+    x: torch.Tensor,
+    dims: Sequence[int],
+    block_size: int,
+) -> tuple[torch.Tensor, list[int], torch.Size, torch.Size]:
+    if block_size <= 0:
+        raise ValueError("block_size must be > 0")
+
+    axes = sorted(d + x.ndim if d < 0 else d for d in dims)
+    reshaped = x
+    for idx, axis in enumerate(axes):
+        axes[idx] = axis + idx
+        reshaped = torch.unsqueeze(reshaped, dim=axes[idx] + 1)
+
+    orig_shape = reshaped.shape
+    pad = [0] * (2 * len(orig_shape))
+    do_padding = False
+    for axis in axes:
+        axis_len = orig_shape[axis]
+        if axis_len % block_size == 0:
+            continue
+        pad[2 * axis] = block_size - axis_len % block_size
+        do_padding = True
+
+    if do_padding:
+        reshaped = F.pad(reshaped, list(reversed(pad)), mode="constant")
+
+    padded_shape = reshaped.shape
+    target_shape = list(padded_shape)
+    for axis in axes:
+        if target_shape[axis] >= block_size:
+            target_shape[axis + 1] = block_size
+            target_shape[axis] = target_shape[axis] // block_size
+        else:
+            target_shape[axis + 1] = target_shape[axis]
+            target_shape[axis] = 1
+
+    reshaped = reshaped.reshape(target_shape)
+    return reshaped, axes, orig_shape, padded_shape
+
+
+def _undo_reshape_to_blocks(
+    x: torch.Tensor,
+    padded_shape: torch.Size,
+    orig_shape: torch.Size,
+    axes: Sequence[int],
+) -> torch.Tensor:
+    restored = x.reshape(padded_shape)
+    index = [slice(None)] * restored.ndim
+    for axis in axes:
+        index[axis] = slice(0, orig_shape[axis])
+    restored = restored[tuple(index)]
+    squeeze_dims = [axis + 1 for axis in axes]
+    for axis in reversed(squeeze_dims):
+        restored = restored.squeeze(axis)
+    return restored
+
+
 def _block_mxfp_quant(
     x: torch.Tensor,
     bit_width: int,
@@ -128,7 +187,17 @@ def _block_mxfp_quant(
     """
 
     exp_bits, mantissa_bits_with_sign, emax, max_norm = _mxfp_elem_format_params(bit_width)
-    shared_exp = _shared_exponents(x, dims=dims) - emax
+    quantized_input = x
+    shared_exp_dims = dims
+    block_axes: list[int] | None = None
+    padded_shape: torch.Size | None = None
+    orig_shape: torch.Size | None = None
+
+    if dims is not None:
+        quantized_input, block_axes, orig_shape, padded_shape = _reshape_to_blocks(x, dims=dims, block_size=MXFP_BLOCK_SIZE)
+        shared_exp_dims = [axis + 1 for axis in block_axes]
+
+    shared_exp = _shared_exponents(quantized_input, dims=shared_exp_dims) - emax
 
     scale_emax = 2 ** (MXFP_SCALE_BITS - 1) - 1
     shared_exp = torch.where(shared_exp > scale_emax, torch.full_like(shared_exp, float("NaN")), shared_exp)
@@ -136,12 +205,16 @@ def _block_mxfp_quant(
 
     scale = torch.pow(torch.full_like(shared_exp, 2.0), shared_exp)
     quantized = _quantize_elemwise_core_mxfp(
-        x / scale,
+        quantized_input / scale,
         bits=mantissa_bits_with_sign,
         exp_bits=exp_bits,
         max_norm=max_norm,
     )
-    return quantized * scale
+    quantized = quantized * scale
+
+    if dims is not None and block_axes is not None and padded_shape is not None and orig_shape is not None:
+        quantized = _undo_reshape_to_blocks(quantized, padded_shape=padded_shape, orig_shape=orig_shape, axes=block_axes)
+    return quantized
 
 
 def _resolve_nvfp_layout(bit_width: int) -> tuple[int, int]:
@@ -201,6 +274,13 @@ def _quantize_finite_float(
 
     quantized = torch.where(is_normal, normal_value, subnormal_value)
     return x_sign * quantized
+
+def quantize_mx_fix( A, quant_bit=4, scale_bits=8, block_size=32, ): 
+    """Function used for MX* quantization""" 
+    assert scale_bits > 0 
+    if quant_bit == 8:
+        ebits, mbits, emax, max_norm = 4, 5, 8, 448.0 
+    # e4m3 min_exp = -6 elif quant_bit == 4: ebits, mbits, emax, max_norm = 2, 3, 2, 6.0 # e2m1 min_exp = 0 else: raise Exception("quant_bit must be 8 or 4") # mantissa fractional quant scale # e4m3 -> 2^3 = 8 # e2m1 -> 2^1 = 2 mantissa_scale = 2 ** (mbits - 2) # shared scale exponent range scale_emax = 2 ** (scale_bits - 1) - 1 ori_shape = A.shape last_dim = ori_shape[-1] # -------- pad to block_size on last dim -------- pad_size = (-last_dim) % block_size if pad_size != 0: A = F.pad(A, (0, pad_size)) padded_shape = A.shape # flatten all leading dims, keep block on last dim A = A.reshape(-1, block_size) # ------------------------- # 1) shared exponent # ------------------------- abs_A = torch.abs(A) shared_abs_max = torch.amax(abs_A, dim=-1, keepdim=True) # safe log2 for zero blocks safe_shared = torch.where( shared_abs_max > 0, shared_abs_max, torch.ones_like(shared_abs_max) ) # round2decimal - 保留你的进位优化 exponent = torch.floor(torch.log2(safe_shared)) mantissa = safe_shared / torch.exp2(exponent) shared_exp = torch.where(mantissa > 1.75, exponent + 1, exponent) # all-zero block -> exponent set to 0 shared_exp = torch.where(shared_abs_max > 0, shared_exp, torch.zeros_like(shared_exp)) # shift by element-format emax shared_exp = shared_exp - emax # clamp to scale_bits range shared_exp = shared_exp.clamp(min=-scale_emax, max=scale_emax) # apply shared scaling A = A / torch.exp2(shared_exp) # ------------------------- # 2) private exponent # ------------------------- abs_A = torch.abs(A) safe_abs_A = torch.where(abs_A > 0, abs_A, torch.ones_like(abs_A)) private_exp = torch.floor(torch.log2(safe_abs_A)) private_exp = private_exp.clamp(min=min_exp) private_exp = torch.exp2(private_exp) # ------------------------- # 3) mantissa quantization # ------------------------- A = A / private_exp * mantissa_scale A = torch.sign(A) * torch.floor(torch.abs(A) + 0.5) # round-half-up A = A / mantissa_scale * private_exp # saturate to representable finite range A = torch.clamp(A, min=-max_norm, max=max_norm) # undo shared scaling A = A * torch.exp2(shared_exp) # -------- restore shape and remove pad -------- A = A.reshape(padded_shape) if pad_size != 0: A = A[..., :last_dim] return A
 
 
 def _nvfp_quant(
