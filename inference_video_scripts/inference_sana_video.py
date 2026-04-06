@@ -396,16 +396,7 @@ class SanaInference(SanaVideoConfig):
     stg_scale: float = 0.0
     apg_mode: str = "hw"
     num_cached_blocks: int = -1
-    enable_fake_quant: bool = False
-    fake_quant_linear_format: str = "int"
-    fake_quant_conv_format: str = "int"
-    fake_quant_linear_bits: int = 4
-    fake_quant_conv_bits: int = 8
-    fake_quant_linear_mxfp_impl: str = "variant"
-    fake_quant_conv_mxfp_impl: str = "variant"
-    fake_quant_linear_granularity: str = "per_token"
-    fake_quant_weight: bool = True
-    fake_quant_activation: bool = True
+    fake_quant: FakeQuantConfig = field(default_factory=FakeQuantConfig)
 
 
 if __name__ == "__main__":
@@ -548,29 +539,10 @@ if __name__ == "__main__":
 
     logger.warning(f"Missing keys: {missing}")
     logger.warning(f"Unexpected keys: {unexpected}")
-    if args.enable_fake_quant:
-        fake_quant_config = FakeQuantConfig(
-            enable_fake_quant=args.enable_fake_quant,
-            linear_quant_format=args.fake_quant_linear_format,
-            conv_quant_format=args.fake_quant_conv_format,
-            linear_bit_width=args.fake_quant_linear_bits,
-            conv_bit_width=args.fake_quant_conv_bits,
-            linear_mxfp_impl=args.fake_quant_linear_mxfp_impl,
-            conv_mxfp_impl=args.fake_quant_conv_mxfp_impl,
-            enable_weight_fake_quant=args.fake_quant_weight,
-            enable_activation_fake_quant=args.fake_quant_activation,
-            linear_granularity=args.fake_quant_linear_granularity,
-        )
+    if args.fake_quant.enable_fake_quant:
+        fake_quant_config = args.fake_quant
         replacements = apply_fake_quant_to_sana_video_blocks(model, fake_quant_config)
-        logger.info(
-            "Enabled block-only fake quant: "
-            f"linear={args.fake_quant_linear_format}{args.fake_quant_linear_bits} "
-            f"conv={args.fake_quant_conv_format}{args.fake_quant_conv_bits} "
-            f"linear_impl={args.fake_quant_linear_mxfp_impl} "
-            f"conv_impl={args.fake_quant_conv_mxfp_impl} "
-            f"linear_granularity={args.fake_quant_linear_granularity} "
-            f"weight_fq={args.fake_quant_weight} act_fq={args.fake_quant_activation}"
-        )
+        logger.info(f"Enabled block-only fake quant: {fake_quant_config.summary()}")
         logger.info(f"Replaced {len(replacements)} block-internal modules with fake-quant wrappers")
         for replacement in replacements:
             logger.info(
@@ -653,19 +625,8 @@ if __name__ == "__main__":
             save_root += f"_highmotion"
         if args.motion_score > 0:
             save_root += f"_motion{args.motion_score}"
-        if args.enable_fake_quant:
-            save_root += (
-                f"_fq-block-only"
-                f"_l{args.fake_quant_linear_format}{args.fake_quant_linear_bits}"
-                f"_c{args.fake_quant_conv_format}{args.fake_quant_conv_bits}"
-                f"_li-{args.fake_quant_linear_mxfp_impl}"
-                f"_ci-{args.fake_quant_conv_mxfp_impl}"
-                f"_lg-{args.fake_quant_linear_granularity}"
-            )
-            if args.fake_quant_weight:
-                save_root += "_wfq"
-            if args.fake_quant_activation:
-                save_root += "_afq"
+        if args.fake_quant.enable_fake_quant:
+            save_root += args.fake_quant.save_suffix()
         if args.negative_prompt != "":
             save_root += f"_negp{args.negative_prompt[:5].replace(' ', '')}"
 

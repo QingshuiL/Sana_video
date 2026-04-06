@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Sequence
 
 import torch
@@ -18,48 +18,96 @@ MXFP_BLOCK_SIZE = 32
 
 
 @dataclass
-class FakeQuantConfig:
-    enable_fake_quant: bool = False
-    linear_quant_format: QuantFormat = "int"
-    conv_quant_format: QuantFormat = "int"
-    linear_bit_width: int = 4
-    conv_bit_width: int = 8
-    enable_weight_fake_quant: bool = True
-    enable_activation_fake_quant: bool = True
-    linear_granularity: LinearGranularity = "per_token"
-    conv_activation_granularity: str = "per_tensor"
-    conv_weight_granularity: str = "per_channel"
-    linear_mxfp_impl: MXFPImpl = "variant"
-    conv_mxfp_impl: MXFPImpl = "variant"
+class FakeQuantLinearConfig:
+    quant_format: QuantFormat = "int"
+    bit_width: int = 4
+    granularity: LinearGranularity = "per_token"
+    mxfp_impl: MXFPImpl = "variant"
 
     def validate(self) -> None:
         valid_formats = {"int", "mxfp", "nvfp"}
-        if self.linear_quant_format not in valid_formats:
-            raise ValueError(f"Unsupported linear quant format: {self.linear_quant_format}")
-        if self.conv_quant_format not in valid_formats:
-            raise ValueError(f"Unsupported conv quant format: {self.conv_quant_format}")
-        if self.linear_granularity not in {"per_token", "per_channel"}:
-            raise ValueError(f"Unsupported linear granularity: {self.linear_granularity}")
-        if self.linear_mxfp_impl not in {"variant", "floor"}:
-            raise ValueError(f"Unsupported linear MXFP implementation: {self.linear_mxfp_impl}")
-        if self.conv_mxfp_impl not in {"variant", "floor"}:
-            raise ValueError(f"Unsupported conv MXFP implementation: {self.conv_mxfp_impl}")
-        if self.conv_activation_granularity != "per_tensor":
-            raise ValueError("Conv2d activation granularity must be per_tensor")
-        if self.conv_weight_granularity != "per_channel":
-            raise ValueError("Conv2d weight granularity must be per_channel")
-        if self.linear_bit_width < 2:
-            raise ValueError("linear_bit_width must be >= 2")
-        if self.conv_bit_width < 2:
-            raise ValueError("conv_bit_width must be >= 2")
-        if self.linear_quant_format == "nvfp" and self.linear_bit_width < 4:
-            raise ValueError("nvfp linear quantization requires linear_bit_width >= 4")
-        if self.conv_quant_format == "nvfp" and self.conv_bit_width < 4:
-            raise ValueError("nvfp conv quantization requires conv_bit_width >= 4")
-        if self.linear_quant_format == "mxfp" and self.linear_bit_width not in {4, 8}:
+        if self.quant_format not in valid_formats:
+            raise ValueError(f"Unsupported linear quant format: {self.quant_format}")
+        if self.granularity not in {"per_token", "per_channel"}:
+            raise ValueError(f"Unsupported linear granularity: {self.granularity}")
+        if self.mxfp_impl not in {"variant", "floor"}:
+            raise ValueError(f"Unsupported linear MXFP implementation: {self.mxfp_impl}")
+        if self.bit_width < 2:
+            raise ValueError("linear bit_width must be >= 2")
+        if self.quant_format == "nvfp" and self.bit_width < 4:
+            raise ValueError("nvfp linear quantization requires bit_width >= 4")
+        if self.quant_format == "mxfp" and self.bit_width not in {4, 8}:
             raise ValueError("mxfp linear quantization only supports bit_width=4 (fp4_e2m1) or bit_width=8 (fp8_e4m3)")
-        if self.conv_quant_format == "mxfp" and self.conv_bit_width not in {4, 8}:
+
+
+@dataclass
+class FakeQuantConv2dConfig:
+    quant_format: QuantFormat = "int"
+    bit_width: int = 8
+    activation_granularity: str = "per_tensor"
+    weight_granularity: str = "per_channel"
+    mxfp_impl: MXFPImpl = "variant"
+
+    def validate(self) -> None:
+        valid_formats = {"int", "mxfp", "nvfp"}
+        if self.quant_format not in valid_formats:
+            raise ValueError(f"Unsupported conv quant format: {self.quant_format}")
+        if self.mxfp_impl not in {"variant", "floor"}:
+            raise ValueError(f"Unsupported conv MXFP implementation: {self.mxfp_impl}")
+        if self.activation_granularity != "per_tensor":
+            raise ValueError("Conv2d activation granularity must be per_tensor")
+        if self.weight_granularity != "per_channel":
+            raise ValueError("Conv2d weight granularity must be per_channel")
+        if self.bit_width < 2:
+            raise ValueError("conv bit_width must be >= 2")
+        if self.quant_format == "nvfp" and self.bit_width < 4:
+            raise ValueError("nvfp conv quantization requires bit_width >= 4")
+        if self.quant_format == "mxfp" and self.bit_width not in {4, 8}:
             raise ValueError("mxfp conv quantization only supports bit_width=4 (fp4_e2m1) or bit_width=8 (fp8_e4m3)")
+
+
+@dataclass
+class FakeQuantConfig:
+    enable_fake_quant: bool = False
+    enable_weight_fake_quant: bool = True
+    enable_activation_fake_quant: bool = True
+    linear: FakeQuantLinearConfig = field(default_factory=FakeQuantLinearConfig)
+    conv: FakeQuantConv2dConfig = field(default_factory=FakeQuantConv2dConfig)
+
+    def validate(self) -> None:
+        self.linear.validate()
+        self.conv.validate()
+
+    def summary(self) -> str:
+        parts = [
+            f"linear={self.linear.quant_format}{self.linear.bit_width}",
+            f"conv={self.conv.quant_format}{self.conv.bit_width}",
+            f"linear_granularity={self.linear.granularity}",
+            f"weight_fq={self.enable_weight_fake_quant}",
+            f"act_fq={self.enable_activation_fake_quant}",
+        ]
+        if self.linear.quant_format == "mxfp":
+            parts.append(f"linear_impl={self.linear.mxfp_impl}")
+        if self.conv.quant_format == "mxfp":
+            parts.append(f"conv_impl={self.conv.mxfp_impl}")
+        return " ".join(parts)
+
+    def save_suffix(self) -> str:
+        suffix = (
+            f"_fq-block-only"
+            f"_l{self.linear.quant_format}{self.linear.bit_width}"
+            f"_c{self.conv.quant_format}{self.conv.bit_width}"
+            f"_lg-{self.linear.granularity}"
+        )
+        if self.linear.quant_format == "mxfp":
+            suffix += f"_li-{self.linear.mxfp_impl}"
+        if self.conv.quant_format == "mxfp":
+            suffix += f"_ci-{self.conv.mxfp_impl}"
+        if self.enable_weight_fake_quant:
+            suffix += "_wfq"
+        if self.enable_activation_fake_quant:
+            suffix += "_afq"
+        return suffix
 
 
 def _safe_absmax(x: torch.Tensor, dims: Sequence[int] | None = None) -> torch.Tensor:
@@ -373,27 +421,27 @@ class FakeQuantLinear(_FakeQuantModule):
         return cls(linear, config)
 
     def _quantize_activation(self, x: torch.Tensor) -> torch.Tensor:
-        if self.config.linear_granularity == "per_token":
+        if self.config.linear.granularity == "per_token":
             dims = [x.ndim - 1]
         else:
             dims = list(range(x.ndim - 1))
         return self._quantize_tensor(
             x,
             enabled=self.config.enable_activation_fake_quant,
-            quant_format=self.config.linear_quant_format,
-            bit_width=self.config.linear_bit_width,
+            quant_format=self.config.linear.quant_format,
+            bit_width=self.config.linear.bit_width,
             dims=dims,
-            mxfp_impl=self.config.linear_mxfp_impl,
+            mxfp_impl=self.config.linear.mxfp_impl,
         )
 
     def _quantize_weight(self) -> torch.Tensor:
         return self._quantize_tensor(
             self.weight,
             enabled=self.config.enable_weight_fake_quant,
-            quant_format=self.config.linear_quant_format,
-            bit_width=self.config.linear_bit_width,
+            quant_format=self.config.linear.quant_format,
+            bit_width=self.config.linear.bit_width,
             dims=[1],
-            mxfp_impl=self.config.linear_mxfp_impl,
+            mxfp_impl=self.config.linear.mxfp_impl,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -423,20 +471,20 @@ class FakeQuantConv2d(_FakeQuantModule):
         return self._quantize_tensor(
             x,
             enabled=self.config.enable_activation_fake_quant,
-            quant_format=self.config.conv_quant_format,
-            bit_width=self.config.conv_bit_width,
+            quant_format=self.config.conv.quant_format,
+            bit_width=self.config.conv.bit_width,
             dims=None,
-            mxfp_impl=self.config.conv_mxfp_impl,
+            mxfp_impl=self.config.conv.mxfp_impl,
         )
 
     def _quantize_weight(self) -> torch.Tensor:
         return self._quantize_tensor(
             self.weight,
             enabled=self.config.enable_weight_fake_quant,
-            quant_format=self.config.conv_quant_format,
-            bit_width=self.config.conv_bit_width,
+            quant_format=self.config.conv.quant_format,
+            bit_width=self.config.conv.bit_width,
             dims=[1, 2, 3],
-            mxfp_impl=self.config.conv_mxfp_impl,
+            mxfp_impl=self.config.conv.mxfp_impl,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -476,10 +524,10 @@ def _replace_modules_in_block(
                     "block": str(block_idx),
                     "module": full_name,
                     "type": "Linear",
-                    "format": config.linear_quant_format,
-                    "bits": str(config.linear_bit_width),
-                    "granularity": config.linear_granularity,
-                    "impl": config.linear_mxfp_impl if config.linear_quant_format == "mxfp" else "",
+                    "format": config.linear.quant_format,
+                    "bits": str(config.linear.bit_width),
+                    "granularity": config.linear.granularity,
+                    "impl": config.linear.mxfp_impl if config.linear.quant_format == "mxfp" else "",
                 }
             )
             continue
@@ -490,10 +538,10 @@ def _replace_modules_in_block(
                     "block": str(block_idx),
                     "module": full_name,
                     "type": "Conv2d",
-                    "format": config.conv_quant_format,
-                    "bits": str(config.conv_bit_width),
+                    "format": config.conv.quant_format,
+                    "bits": str(config.conv.bit_width),
                     "granularity": "act:per_tensor,weight:per_channel",
-                    "impl": config.conv_mxfp_impl if config.conv_quant_format == "mxfp" else "",
+                    "impl": config.conv.mxfp_impl if config.conv.quant_format == "mxfp" else "",
                 }
             )
             continue
