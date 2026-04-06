@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 QuantFormat = Literal["int", "mxfp", "nvfp"]
 LinearGranularity = Literal["per_token", "per_channel"]
+MXFPImpl = Literal["variant", "floor"]
 FP32_MIN_NORMAL = 2 ** (-126)
 MXFP_SCALE_BITS = 8
 MXFP_BLOCK_SIZE = 32
@@ -28,6 +29,8 @@ class FakeQuantConfig:
     linear_granularity: LinearGranularity = "per_token"
     conv_activation_granularity: str = "per_tensor"
     conv_weight_granularity: str = "per_channel"
+    linear_mxfp_impl: MXFPImpl = "variant"
+    conv_mxfp_impl: MXFPImpl = "variant"
 
     def validate(self) -> None:
         valid_formats = {"int", "mxfp", "nvfp"}
@@ -37,6 +40,10 @@ class FakeQuantConfig:
             raise ValueError(f"Unsupported conv quant format: {self.conv_quant_format}")
         if self.linear_granularity not in {"per_token", "per_channel"}:
             raise ValueError(f"Unsupported linear granularity: {self.linear_granularity}")
+        if self.linear_mxfp_impl not in {"variant", "floor"}:
+            raise ValueError(f"Unsupported linear MXFP implementation: {self.linear_mxfp_impl}")
+        if self.conv_mxfp_impl not in {"variant", "floor"}:
+            raise ValueError(f"Unsupported conv MXFP implementation: {self.conv_mxfp_impl}")
         if self.conv_activation_granularity != "per_tensor":
             raise ValueError("Conv2d activation granularity must be per_tensor")
         if self.conv_weight_granularity != "per_channel":
@@ -65,156 +72,139 @@ def _round_nearest_away_from_zero(x: torch.Tensor) -> torch.Tensor:
     return torch.sign(x) * torch.floor(torch.abs(x) + 0.5)
 
 
-def _safe_lshift(x: torch.Tensor, bits: int, exp: torch.Tensor | None) -> torch.Tensor:
-    if exp is None:
-        return x * (2**bits)
-    return x / torch.pow(torch.full_like(x, 2.0), exp) * (2**bits)
-
-
-def _safe_rshift(x: torch.Tensor, bits: int, exp: torch.Tensor | None) -> torch.Tensor:
-    if exp is None:
-        return x / (2**bits)
-    return x / (2**bits) * torch.pow(torch.full_like(x, 2.0), exp)
-
-
-def _mxfp_elem_format_params(bit_width: int) -> tuple[int, int, int, float]:
-    if bit_width == 4:
-        return 2, 3, 2, 2**2 * 1.5
+def _mxfp_elem_format_params(bit_width: int) -> tuple[int, int, float, int]:
     if bit_width == 8:
-        return 4, 5, 8, 2**8 * 1.75
+        return 5, 448.0, -6, 8
+    if bit_width == 4:
+        return 3, 6.0, 0, 2
     raise ValueError("mxfp only supports bit_width=4 (fp4_e2m1) or bit_width=8 (fp8_e4m3)")
 
 
-def _shared_exponents(x: torch.Tensor, dims: Sequence[int] | None = None) -> torch.Tensor:
-    if dims is None:
-        shared = torch.max(torch.abs(x))
-    else:
-        shared = torch.abs(x).amax(dim=tuple(dims), keepdim=True)
-    zero_mask = (shared == 0).to(shared.dtype)
-    return torch.floor(torch.log2(shared + FP32_MIN_NORMAL * zero_mask))
-
-
-def _quantize_elemwise_core_mxfp(
-    x: torch.Tensor,
-    bits: int,
-    exp_bits: int,
-    max_norm: float,
-) -> torch.Tensor:
-    private_exp = torch.floor(torch.log2(torch.abs(x) + (x == 0).to(x.dtype)))
-    min_exp = -(2 ** (exp_bits - 1)) + 2
-    private_exp = private_exp.clamp(min=min_exp)
-
-    quantized = _safe_lshift(x, bits - 2, private_exp)
-    quantized = _round_nearest_away_from_zero(quantized)
-    quantized = _safe_rshift(quantized, bits - 2, private_exp)
-    quantized = torch.clamp(quantized, min=-max_norm, max=max_norm)
-
-    quantized = torch.where(x == float("Inf"), torch.full_like(quantized, float("Inf")), quantized)
-    quantized = torch.where(x == -float("Inf"), torch.full_like(quantized, -float("Inf")), quantized)
-    quantized = torch.where(torch.isnan(x), torch.full_like(quantized, float("NaN")), quantized)
-    return quantized
-
-
-def _reshape_to_blocks(
-    x: torch.Tensor,
-    dims: Sequence[int],
-    block_size: int,
-) -> tuple[torch.Tensor, list[int], torch.Size, torch.Size]:
-    if block_size <= 0:
-        raise ValueError("block_size must be > 0")
-
-    axes = sorted(d + x.ndim if d < 0 else d for d in dims)
-    reshaped = x
-    for idx, axis in enumerate(axes):
-        axes[idx] = axis + idx
-        reshaped = torch.unsqueeze(reshaped, dim=axes[idx] + 1)
-
-    orig_shape = reshaped.shape
-    pad = [0] * (2 * len(orig_shape))
-    do_padding = False
-    for axis in axes:
-        axis_len = orig_shape[axis]
-        if axis_len % block_size == 0:
-            continue
-        pad[2 * axis] = block_size - axis_len % block_size
-        do_padding = True
-
-    if do_padding:
-        reshaped = F.pad(reshaped, list(reversed(pad)), mode="constant")
-
-    padded_shape = reshaped.shape
-    target_shape = list(padded_shape)
-    for axis in axes:
-        if target_shape[axis] >= block_size:
-            target_shape[axis + 1] = block_size
-            target_shape[axis] = target_shape[axis] // block_size
-        else:
-            target_shape[axis + 1] = target_shape[axis]
-            target_shape[axis] = 1
-
-    reshaped = reshaped.reshape(target_shape)
-    return reshaped, axes, orig_shape, padded_shape
-
-
-def _undo_reshape_to_blocks(
-    x: torch.Tensor,
-    padded_shape: torch.Size,
-    orig_shape: torch.Size,
-    axes: Sequence[int],
-) -> torch.Tensor:
-    restored = x.reshape(padded_shape)
-    index = [slice(None)] * restored.ndim
-    for axis in axes:
-        index[axis] = slice(0, orig_shape[axis])
-    restored = restored[tuple(index)]
-    squeeze_dims = [axis + 1 for axis in axes]
-    for axis in reversed(squeeze_dims):
-        restored = restored.squeeze(axis)
-    return restored
-
-
-def _block_mxfp_quant(
+def _apply_mxfp_block_quant(
     x: torch.Tensor,
     bit_width: int,
+    block_quantizer,
     dims: Sequence[int] | None = None,
 ) -> torch.Tensor:
-    """
-    MXFP quantization aligned with microxcaling for fp4_e2m1 and fp8_e4m3.
+    if dims is None:
+        return block_quantizer(
+            x.reshape(1, -1),
+            quant_bit=bit_width,
+            scale_bits=MXFP_SCALE_BITS,
+            block_size=MXFP_BLOCK_SIZE,
+        ).reshape_as(x)
 
-    The tensor shares one exponent across the reduction axes, then each element
-    is quantized with the selected floating-point element format before being
-    rescaled back to fp32.
-    """
+    normalized_dims = sorted({d + x.ndim if d < 0 else d for d in dims})
+    kept_dims = [dim for dim in range(x.ndim) if dim not in normalized_dims]
+    permute_order = kept_dims + normalized_dims
+    permuted = x.permute(permute_order).contiguous()
 
-    exp_bits, mantissa_bits_with_sign, emax, max_norm = _mxfp_elem_format_params(bit_width)
-    quantized_input = x
-    shared_exp_dims = dims
-    block_axes: list[int] | None = None
-    padded_shape: torch.Size | None = None
-    orig_shape: torch.Size | None = None
+    kept_shape = [x.shape[dim] for dim in kept_dims]
+    reduced_shape = [x.shape[dim] for dim in normalized_dims]
+    reduced_size = 1
+    for size in reduced_shape:
+        reduced_size *= size
 
-    if dims is not None:
-        quantized_input, block_axes, orig_shape, padded_shape = _reshape_to_blocks(x, dims=dims, block_size=MXFP_BLOCK_SIZE)
-        shared_exp_dims = [axis + 1 for axis in block_axes]
+    quantized = block_quantizer(
+        permuted.reshape(-1, reduced_size),
+        quant_bit=bit_width,
+        scale_bits=MXFP_SCALE_BITS,
+        block_size=MXFP_BLOCK_SIZE,
+    )
+    quantized = quantized.reshape(*kept_shape, *reduced_shape)
 
-    shared_exp = _shared_exponents(quantized_input, dims=shared_exp_dims) - emax
+    inverse_order = [0] * x.ndim
+    for idx, dim in enumerate(permute_order):
+        inverse_order[dim] = idx
+    return quantized.permute(inverse_order).contiguous()
 
-    scale_emax = 2 ** (MXFP_SCALE_BITS - 1) - 1
+
+def quantize_mx_fix(A: torch.Tensor, quant_bit: int = 4, scale_bits: int = 8, block_size: int = 32) -> torch.Tensor:
+    """Local MXFP variant that rounds the shared exponent up for large mantissas."""
+    assert scale_bits > 0
+    mbits, max_norm, min_exp, emax = _mxfp_elem_format_params(quant_bit)
+
+    mantissa_scale = 2 ** (mbits - 2)
+    scale_emax = 2 ** (scale_bits - 1) - 1
+    last_dim = A.shape[-1]
+
+    pad_size = (-last_dim) % block_size
+    if pad_size != 0:
+        A = F.pad(A, (0, pad_size))
+
+    padded_shape = A.shape
+    A = A.reshape(-1, block_size)
+
+    abs_A = torch.abs(A)
+    shared_abs_max = torch.amax(abs_A, dim=-1, keepdim=True)
+    safe_shared = torch.where(shared_abs_max > 0, shared_abs_max, torch.ones_like(shared_abs_max))
+
+    exponent = torch.floor(torch.log2(safe_shared))
+    mantissa = safe_shared / torch.exp2(exponent)
+    shared_exp = torch.where(mantissa > 1.75, exponent + 1, exponent)
+    shared_exp = torch.where(shared_abs_max > 0, shared_exp, torch.zeros_like(shared_exp))
+    shared_exp = (shared_exp - emax).clamp(min=-scale_emax, max=scale_emax)
+    A = A / torch.exp2(shared_exp)
+
+    abs_A = torch.abs(A)
+    safe_abs_A = torch.where(abs_A > 0, abs_A, torch.ones_like(abs_A))
+    private_exp = torch.floor(torch.log2(safe_abs_A))
+    private_exp = torch.exp2(private_exp.clamp(min=min_exp))
+
+    A = A / private_exp * mantissa_scale
+    A = torch.sign(A) * torch.floor(torch.abs(A) + 0.5)
+    A = A / mantissa_scale * private_exp
+    A = torch.clamp(A, min=-max_norm, max=max_norm)
+    A = A * torch.exp2(shared_exp)
+
+    A = A.reshape(padded_shape)
+    if pad_size != 0:
+        A = A[..., :last_dim]
+    return A
+
+
+def quantize_mx_floor(A: torch.Tensor, quant_bit: int = 4, scale_bits: int = 8, block_size: int = 32) -> torch.Tensor:
+    """MXFP quantization aligned with the official FLOOR shared-exponent rule."""
+    assert scale_bits > 0
+    mbits, max_norm, min_exp, emax = _mxfp_elem_format_params(quant_bit)
+
+    mantissa_scale = 2 ** (mbits - 2)
+    scale_emax = 2 ** (scale_bits - 1) - 1
+    last_dim = A.shape[-1]
+
+    pad_size = (-last_dim) % block_size
+    if pad_size != 0:
+        A = F.pad(A, (0, pad_size))
+
+    padded_shape = A.shape
+    A = A.reshape(-1, block_size)
+
+    abs_A = torch.abs(A)
+    shared_abs_max = torch.amax(abs_A, dim=-1, keepdim=True)
+    shared_exp = torch.floor(torch.log2(shared_abs_max + FP32_MIN_NORMAL * (shared_abs_max == 0).to(shared_abs_max.dtype)))
+    shared_exp = shared_exp - emax
     shared_exp = torch.where(shared_exp > scale_emax, torch.full_like(shared_exp, float("NaN")), shared_exp)
     shared_exp = torch.clamp(shared_exp, min=-scale_emax)
 
     scale = torch.pow(torch.full_like(shared_exp, 2.0), shared_exp)
-    quantized = _quantize_elemwise_core_mxfp(
-        quantized_input / scale,
-        bits=mantissa_bits_with_sign,
-        exp_bits=exp_bits,
-        max_norm=max_norm,
-    )
-    quantized = quantized * scale
+    normalized = A / scale
+    private_exp = torch.floor(torch.log2(torch.abs(normalized) + (normalized == 0).to(normalized.dtype)))
+    private_exp = private_exp.clamp(min=min_exp)
 
-    if dims is not None and block_axes is not None and padded_shape is not None and orig_shape is not None:
-        quantized = _undo_reshape_to_blocks(quantized, padded_shape=padded_shape, orig_shape=orig_shape, axes=block_axes)
-    return quantized
+    normalized = normalized / torch.pow(torch.full_like(normalized, 2.0), private_exp) * mantissa_scale
+    normalized = _round_nearest_away_from_zero(normalized)
+    normalized = normalized / mantissa_scale * torch.pow(torch.full_like(normalized, 2.0), private_exp)
+    normalized = torch.clamp(normalized, min=-max_norm, max=max_norm)
+
+    normalized = torch.where(A == float("Inf"), torch.full_like(normalized, float("Inf")), normalized)
+    normalized = torch.where(A == -float("Inf"), torch.full_like(normalized, -float("Inf")), normalized)
+    normalized = torch.where(torch.isnan(A), torch.full_like(normalized, float("NaN")), normalized)
+
+    A = normalized * scale
+    A = A.reshape(padded_shape)
+    if pad_size != 0:
+        A = A[..., :last_dim]
+    return A
 
 
 def _resolve_nvfp_layout(bit_width: int) -> tuple[int, int]:
@@ -275,13 +265,6 @@ def _quantize_finite_float(
     quantized = torch.where(is_normal, normal_value, subnormal_value)
     return x_sign * quantized
 
-def quantize_mx_fix( A, quant_bit=4, scale_bits=8, block_size=32, ): 
-    """Function used for MX* quantization""" 
-    assert scale_bits > 0 
-    if quant_bit == 8:
-        ebits, mbits, emax, max_norm = 4, 5, 8, 448.0 
-    # e4m3 min_exp = -6 elif quant_bit == 4: ebits, mbits, emax, max_norm = 2, 3, 2, 6.0 # e2m1 min_exp = 0 else: raise Exception("quant_bit must be 8 or 4") # mantissa fractional quant scale # e4m3 -> 2^3 = 8 # e2m1 -> 2^1 = 2 mantissa_scale = 2 ** (mbits - 2) # shared scale exponent range scale_emax = 2 ** (scale_bits - 1) - 1 ori_shape = A.shape last_dim = ori_shape[-1] # -------- pad to block_size on last dim -------- pad_size = (-last_dim) % block_size if pad_size != 0: A = F.pad(A, (0, pad_size)) padded_shape = A.shape # flatten all leading dims, keep block on last dim A = A.reshape(-1, block_size) # ------------------------- # 1) shared exponent # ------------------------- abs_A = torch.abs(A) shared_abs_max = torch.amax(abs_A, dim=-1, keepdim=True) # safe log2 for zero blocks safe_shared = torch.where( shared_abs_max > 0, shared_abs_max, torch.ones_like(shared_abs_max) ) # round2decimal - 保留你的进位优化 exponent = torch.floor(torch.log2(safe_shared)) mantissa = safe_shared / torch.exp2(exponent) shared_exp = torch.where(mantissa > 1.75, exponent + 1, exponent) # all-zero block -> exponent set to 0 shared_exp = torch.where(shared_abs_max > 0, shared_exp, torch.zeros_like(shared_exp)) # shift by element-format emax shared_exp = shared_exp - emax # clamp to scale_bits range shared_exp = shared_exp.clamp(min=-scale_emax, max=scale_emax) # apply shared scaling A = A / torch.exp2(shared_exp) # ------------------------- # 2) private exponent # ------------------------- abs_A = torch.abs(A) safe_abs_A = torch.where(abs_A > 0, abs_A, torch.ones_like(abs_A)) private_exp = torch.floor(torch.log2(safe_abs_A)) private_exp = private_exp.clamp(min=min_exp) private_exp = torch.exp2(private_exp) # ------------------------- # 3) mantissa quantization # ------------------------- A = A / private_exp * mantissa_scale A = torch.sign(A) * torch.floor(torch.abs(A) + 0.5) # round-half-up A = A / mantissa_scale * private_exp # saturate to representable finite range A = torch.clamp(A, min=-max_norm, max=max_norm) # undo shared scaling A = A * torch.exp2(shared_exp) # -------- restore shape and remove pad -------- A = A.reshape(padded_shape) if pad_size != 0: A = A[..., :last_dim] return A
-
 
 def _nvfp_quant(
     x: torch.Tensor,
@@ -300,8 +283,6 @@ def _nvfp_quant(
     exp_bits, mantissa_bits = _resolve_nvfp_layout(bit_width)
     max_finite = (2.0 - 2.0 ** (-mantissa_bits)) * (2.0 ** ((2**exp_bits - 2) - (2 ** (exp_bits - 1) - 1)))
     absmax = _safe_absmax(x, dims)
-    # NVFP uses a shared scale for a block/group, but elements inside the block
-    # still get their own limited exponent+mantissa representation.
     block_scale = (absmax / max_finite).clamp_min(1e-12)
     normalized = x / block_scale
     quantized = _quantize_finite_float(normalized, exp_bits=exp_bits, mantissa_bits=mantissa_bits)
@@ -315,8 +296,17 @@ def fake_quant_int(x: torch.Tensor, bit_width: int, dims: Sequence[int] | None =
     return q * scale
 
 
-def fake_quant_mxfp(x: torch.Tensor, bit_width: int, dims: Sequence[int] | None = None) -> torch.Tensor:
-    return _block_mxfp_quant(x, bit_width=bit_width, dims=dims)
+def fake_quant_mxfp(
+    x: torch.Tensor,
+    bit_width: int,
+    dims: Sequence[int] | None = None,
+    impl: MXFPImpl = "variant",
+) -> torch.Tensor:
+    if impl == "variant":
+        return _apply_mxfp_block_quant(x, bit_width=bit_width, dims=dims, block_quantizer=quantize_mx_fix)
+    if impl == "floor":
+        return _apply_mxfp_block_quant(x, bit_width=bit_width, dims=dims, block_quantizer=quantize_mx_floor)
+    raise ValueError(f"Unsupported MXFP implementation: {impl}")
 
 
 def fake_quant_nvfp(x: torch.Tensor, bit_width: int, dims: Sequence[int] | None = None) -> torch.Tensor:
@@ -328,55 +318,82 @@ def fake_quantize_tensor(
     quant_format: QuantFormat,
     bit_width: int,
     dims: Sequence[int] | None = None,
+    mxfp_impl: MXFPImpl = "variant",
 ) -> torch.Tensor:
     if quant_format == "int":
         return fake_quant_int(x, bit_width=bit_width, dims=dims)
     if quant_format == "mxfp":
-        return fake_quant_mxfp(x, bit_width=bit_width, dims=dims)
+        return fake_quant_mxfp(x, bit_width=bit_width, dims=dims, impl=mxfp_impl)
     if quant_format == "nvfp":
         return fake_quant_nvfp(x, bit_width=bit_width, dims=dims)
     raise ValueError(f"Unsupported quant format: {quant_format}")
 
 
-class FakeQuantLinear(nn.Module):
+class _FakeQuantModule(nn.Module):
+    def _init_fake_quant_state(
+        self,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        config: FakeQuantConfig,
+    ) -> None:
+        self.weight = nn.Parameter(weight.detach().clone(), requires_grad=weight.requires_grad)
+        self.bias = nn.Parameter(bias.detach().clone(), requires_grad=bias.requires_grad) if bias is not None else None
+        self.config = copy.deepcopy(config)
+
+    def _quantize_tensor(
+        self,
+        x: torch.Tensor,
+        *,
+        enabled: bool,
+        quant_format: QuantFormat,
+        bit_width: int,
+        dims: Sequence[int] | None,
+        mxfp_impl: MXFPImpl,
+    ) -> torch.Tensor:
+        if not enabled:
+            return x
+        return fake_quantize_tensor(
+            x,
+            quant_format=quant_format,
+            bit_width=bit_width,
+            dims=dims,
+            mxfp_impl=mxfp_impl,
+        )
+
+
+class FakeQuantLinear(_FakeQuantModule):
     def __init__(self, linear: nn.Linear, config: FakeQuantConfig):
         super().__init__()
         self.in_features = linear.in_features
         self.out_features = linear.out_features
-        self.weight = nn.Parameter(linear.weight.detach().clone(), requires_grad=linear.weight.requires_grad)
-        self.bias = (
-            nn.Parameter(linear.bias.detach().clone(), requires_grad=linear.bias.requires_grad)
-            if linear.bias is not None
-            else None
-        )
-        self.config = copy.deepcopy(config)
+        self._init_fake_quant_state(linear.weight, linear.bias, config)
 
     @classmethod
     def from_float(cls, linear: nn.Linear, config: FakeQuantConfig) -> "FakeQuantLinear":
         return cls(linear, config)
 
     def _quantize_activation(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.config.enable_activation_fake_quant:
-            return x
         if self.config.linear_granularity == "per_token":
             dims = [x.ndim - 1]
         else:
             dims = list(range(x.ndim - 1))
-        return fake_quantize_tensor(
+        return self._quantize_tensor(
             x,
+            enabled=self.config.enable_activation_fake_quant,
             quant_format=self.config.linear_quant_format,
             bit_width=self.config.linear_bit_width,
             dims=dims,
+            mxfp_impl=self.config.linear_mxfp_impl,
         )
 
     def _quantize_weight(self) -> torch.Tensor:
-        if not self.config.enable_weight_fake_quant:
-            return self.weight
-        return fake_quantize_tensor(
+        return self._quantize_tensor(
             self.weight,
+            enabled=self.config.enable_weight_fake_quant,
             quant_format=self.config.linear_quant_format,
             bit_width=self.config.linear_bit_width,
             dims=[1],
+            mxfp_impl=self.config.linear_mxfp_impl,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -385,7 +402,7 @@ class FakeQuantLinear(nn.Module):
         return F.linear(x, weight, self.bias)
 
 
-class FakeQuantConv2d(nn.Module):
+class FakeQuantConv2d(_FakeQuantModule):
     def __init__(self, conv: nn.Conv2d, config: FakeQuantConfig):
         super().__init__()
         self.in_channels = conv.in_channels
@@ -396,36 +413,30 @@ class FakeQuantConv2d(nn.Module):
         self.dilation = conv.dilation
         self.groups = conv.groups
         self.padding_mode = conv.padding_mode
-        self.weight = nn.Parameter(conv.weight.detach().clone(), requires_grad=conv.weight.requires_grad)
-        self.bias = (
-            nn.Parameter(conv.bias.detach().clone(), requires_grad=conv.bias.requires_grad)
-            if conv.bias is not None
-            else None
-        )
-        self.config = copy.deepcopy(config)
+        self._init_fake_quant_state(conv.weight, conv.bias, config)
 
     @classmethod
     def from_float(cls, conv: nn.Conv2d, config: FakeQuantConfig) -> "FakeQuantConv2d":
         return cls(conv, config)
 
     def _quantize_activation(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.config.enable_activation_fake_quant:
-            return x
-        return fake_quantize_tensor(
+        return self._quantize_tensor(
             x,
+            enabled=self.config.enable_activation_fake_quant,
             quant_format=self.config.conv_quant_format,
             bit_width=self.config.conv_bit_width,
             dims=None,
+            mxfp_impl=self.config.conv_mxfp_impl,
         )
 
     def _quantize_weight(self) -> torch.Tensor:
-        if not self.config.enable_weight_fake_quant:
-            return self.weight
-        return fake_quantize_tensor(
+        return self._quantize_tensor(
             self.weight,
+            enabled=self.config.enable_weight_fake_quant,
             quant_format=self.config.conv_quant_format,
             bit_width=self.config.conv_bit_width,
             dims=[1, 2, 3],
+            mxfp_impl=self.config.conv_mxfp_impl,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -468,6 +479,7 @@ def _replace_modules_in_block(
                     "format": config.linear_quant_format,
                     "bits": str(config.linear_bit_width),
                     "granularity": config.linear_granularity,
+                    "impl": config.linear_mxfp_impl if config.linear_quant_format == "mxfp" else "",
                 }
             )
             continue
@@ -481,6 +493,7 @@ def _replace_modules_in_block(
                     "format": config.conv_quant_format,
                     "bits": str(config.conv_bit_width),
                     "granularity": "act:per_tensor,weight:per_channel",
+                    "impl": config.conv_mxfp_impl if config.conv_quant_format == "mxfp" else "",
                 }
             )
             continue

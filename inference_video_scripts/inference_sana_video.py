@@ -401,6 +401,8 @@ class SanaInference(SanaVideoConfig):
     fake_quant_conv_format: str = "int"
     fake_quant_linear_bits: int = 4
     fake_quant_conv_bits: int = 8
+    fake_quant_linear_mxfp_impl: str = "variant"
+    fake_quant_conv_mxfp_impl: str = "variant"
     fake_quant_linear_granularity: str = "per_token"
     fake_quant_weight: bool = True
     fake_quant_activation: bool = True
@@ -553,6 +555,8 @@ if __name__ == "__main__":
             conv_quant_format=args.fake_quant_conv_format,
             linear_bit_width=args.fake_quant_linear_bits,
             conv_bit_width=args.fake_quant_conv_bits,
+            linear_mxfp_impl=args.fake_quant_linear_mxfp_impl,
+            conv_mxfp_impl=args.fake_quant_conv_mxfp_impl,
             enable_weight_fake_quant=args.fake_quant_weight,
             enable_activation_fake_quant=args.fake_quant_activation,
             linear_granularity=args.fake_quant_linear_granularity,
@@ -562,6 +566,8 @@ if __name__ == "__main__":
             "Enabled block-only fake quant: "
             f"linear={args.fake_quant_linear_format}{args.fake_quant_linear_bits} "
             f"conv={args.fake_quant_conv_format}{args.fake_quant_conv_bits} "
+            f"linear_impl={args.fake_quant_linear_mxfp_impl} "
+            f"conv_impl={args.fake_quant_conv_mxfp_impl} "
             f"linear_granularity={args.fake_quant_linear_granularity} "
             f"weight_fq={args.fake_quant_weight} act_fq={args.fake_quant_activation}"
         )
@@ -571,7 +577,8 @@ if __name__ == "__main__":
                 "[fake-quant] "
                 f"block={replacement['block']} module={replacement['module']} "
                 f"type={replacement['type']} format={replacement['format']} "
-                f"bits={replacement['bits']} granularity={replacement['granularity']}"
+                f"bits={replacement['bits']} impl={replacement['impl']} "
+                f"granularity={replacement['granularity']}"
             )
     model.eval().to(weight_dtype)
 
@@ -651,6 +658,8 @@ if __name__ == "__main__":
                 f"_fq-block-only"
                 f"_l{args.fake_quant_linear_format}{args.fake_quant_linear_bits}"
                 f"_c{args.fake_quant_conv_format}{args.fake_quant_conv_bits}"
+                f"_li-{args.fake_quant_linear_mxfp_impl}"
+                f"_ci-{args.fake_quant_conv_mxfp_impl}"
                 f"_lg-{args.fake_quant_linear_granularity}"
             )
             if args.fake_quant_weight:
