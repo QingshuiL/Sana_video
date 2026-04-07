@@ -96,6 +96,32 @@ bash inference_video_scripts/inference_sana_video.sh \
       --work_dir output/sana_t2v_video_results \
       --model.fp32_attention False
 ```
+
+执行单卡量化推理脚本：
+```
+bash inference_video_scripts/inference_sana_video_quant_single.sh \
+      --config configs/sana_video_config/Sana_2000M_480px_AdamW_fsdp.yaml \
+      --model_path hf://Efficient-Large-Model/SANA-Video_2B_480p/checkpoints/SANA_Video_2B_480p.pth \
+      --txt_file=asset/samples/video_prompts_samples.txt \
+      --cfg_scale 6 \
+      --motion_score 30 \
+      --flow_shift 8 \
+      --work_dir output/sana_t2v_video_quant_single_results \
+      --model.fp32_attention False
+```
+
+执行多卡量化推理脚本：
+```
+NP=8 bash inference_video_scripts/inference_sana_video_quant_multi.sh \
+      --config configs/sana_video_config/Sana_2000M_480px_AdamW_fsdp.yaml \
+      --model_path hf://Efficient-Large-Model/SANA-Video_2B_480p/checkpoints/SANA_Video_2B_480p.pth \
+      --txt_file=asset/samples/video_prompts_samples.txt \
+      --cfg_scale 6 \
+      --motion_score 30 \
+      --flow_shift 8 \
+      --work_dir output/sana_t2v_video_quant_multi_results \
+      --model.fp32_attention False
+```
 参数说明：
 - `np`: 推理使用卡数
 - `config`: 推理使用的配置文件

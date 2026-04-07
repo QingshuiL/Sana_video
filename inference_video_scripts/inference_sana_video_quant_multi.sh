@@ -3,10 +3,8 @@ set -e
 
 NP="${NP:-8}"
 
-accelerate launch --num_processes="$NP" --num_machines=1 --mixed_precision=bf16 --main_process_port="$RANDOM" \
-  inference_video_scripts/inference_sana_video.py \
-  --txt_file=asset/samples/video_prompts_samples.txt \
-  --dataset=video_samples \
+bash inference_video_scripts/inference_sana_video.sh \
+  --np "$NP" \
   --fake_quant.enable_fake_quant=True \
   --fake_quant.enable_weight_fake_quant=True \
   --fake_quant.enable_activation_fake_quant=True \
