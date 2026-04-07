@@ -60,3 +60,32 @@ fake_quant:
     bit_width: 8
     mxfp_impl: floor
 ```
+
+Quantized inference helper scripts:
+
+- `inference_video_scripts/inference_sana_video_quant_single.sh`
+- `inference_video_scripts/inference_sana_video_quant_multi.sh`
+
+Single GPU example:
+
+```bash
+bash inference_video_scripts/inference_sana_video_quant_single.sh \
+  --config configs/sana_video_config/Sana_2000M_480px_AdamW_fsdp.yaml \
+  --model_path hf://Efficient-Large-Model/SANA-Video_2B_480p/checkpoints/SANA_Video_2B_480p.pth \
+  --cfg_scale 6 \
+  --motion_score 30 \
+  --flow_shift 8 \
+  --work_dir output/sana_video_quant_single
+```
+
+Multi GPU example:
+
+```bash
+NP=8 bash inference_video_scripts/inference_sana_video_quant_multi.sh \
+  --config configs/sana_video_config/Sana_2000M_480px_AdamW_fsdp.yaml \
+  --model_path hf://Efficient-Large-Model/SANA-Video_2B_480p/checkpoints/SANA_Video_2B_480p.pth \
+  --cfg_scale 6 \
+  --motion_score 30 \
+  --flow_shift 8 \
+  --work_dir output/sana_video_quant_multi
+```
